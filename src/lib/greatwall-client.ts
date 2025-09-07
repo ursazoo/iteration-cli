@@ -79,19 +79,19 @@ export class GreatWallApiClient {
     retriesLeft: number
   ): Promise<GreatWallApiResponse<T>> {
     try {
-      console.log(`🌐 发送请求到长城后端: ${url}`);
-      console.log(`📋 请求头:`, options.headers);
+      // console.log(`🌐 发送请求到长城后端: ${url}`);
+      // console.log(`📋 请求头:`, options.headers);
       
       const response = await fetch(url, options);
       
-      console.log(`📊 响应状态: ${response.status} ${response.statusText}`);
+      // console.log(`📊 响应状态: ${response.status} ${response.statusText}`);
       
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
       const data = await response.json() as GreatWallApiResponse<T>;
-      console.log(`✅ 响应数据:`, data);
+      // console.log(`✅响应数据:`, data);
       
       // 检查业务状态码
       if (data.success === false) {
@@ -107,7 +107,7 @@ export class GreatWallApiClient {
 
       return data;
     } catch (error) {
-      console.log(`❌ 请求错误:`, error);
+      // console.log(`❌ 请求错误:`, error);
       
       // 如果是网络错误且还有重试次数，则重试
       if (retriesLeft > 0 && this.shouldRetry(error as Error)) {
