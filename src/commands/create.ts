@@ -6,7 +6,7 @@ import inquirer from 'inquirer';
 import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigManager } from '../utils/config.js';
-import { GitUtils } from '../utils/git.js';
+import { GitUtils, ComponentSuggestion, FunctionSuggestion } from '../utils/git.js';
 import { GreatWallApiClient } from '../lib/greatwall-client.js';
 import { GreatWallApiManager } from '../lib/greatwall-services.js';
 import {
@@ -143,10 +143,10 @@ async function createIterationFlow(gitInfo: any, users: any[], projectGroups: Gr
   const projectInfo = await collectProjectInfo(users, gitInfo);
   
   // 第三步：组件模块收集
-  const componentModules = await collectComponentModules(users);
+  const componentModules = await collectComponentModules(users, gitInfo);
   
   // 第四步：功能模块收集
-  const functionModules = await collectFunctionModules();
+  const functionModules = await collectFunctionModules(users, gitInfo);
   
   // 第五步：确认CR申请单信息
   const confirmed = await confirmCrRequestInformation({
@@ -193,6 +193,7 @@ async function collectBasicInfo(users: any[], projectGroups: GreatWallProjectGro
       name: 'projectLine',
       message: '选择项目组:',
       choices: projectChoices,
+      pageSize: 12,
       when: projectChoices.length > 0
     },
     {
@@ -228,6 +229,7 @@ async function collectBasicInfo(users: any[], projectGroups: GreatWallProjectGro
       name: 'createUserId',
       message: '选择创建人:',
       choices: userChoices,
+      pageSize: 12,
       when: userChoices.length > 0
     },
     {
@@ -255,9 +257,9 @@ async function createSprintImmediately(apiManager: GreatWallApiManager, basicInf
       createUserId: parseInt(basicInfo.createUserId)
     };
     
-    console.log(chalk.yellow('🔍 调用createSprint接口的参数:'));
-    console.log('传入的basicInfo:', JSON.stringify(basicInfo, null, 2));
-    console.log('构造的sprintParams:', JSON.stringify(sprintParams, null, 2));
+    // console.log(chalk.yellow('🔍 调用createSprint接口的参数:'));
+    // console.log('传入的basicInfo:', JSON.stringify(basicInfo, null, 2));
+    // console.log('构造的sprintParams:', JSON.stringify(sprintParams, null, 2));
     
     const sprintResult = await apiManager.project.createSprint(sprintParams);
     console.log('🔍 完整的API响应结构:', JSON.stringify(sprintResult, null, 2));
@@ -345,6 +347,7 @@ async function collectProjectInfo(users: any[], gitInfo: any) {
       name: 'participants',
       message: '选择参与人员:',
       choices: userChoices,
+      pageSize: 12,
       validate: (answer) => answer.length > 0 || '请至少选择一名参与人员'
     },
     {
@@ -352,6 +355,7 @@ async function collectProjectInfo(users: any[], gitInfo: any) {
       name: 'checkUsers',
       message: '选择审核人员:',
       choices: userChoices,
+      pageSize: 12,
       validate: (answer) => answer.length > 0 || '请至少选择一名审核人员'
     },
     {
@@ -372,30 +376,149 @@ async function collectProjectInfo(users: any[], gitInfo: any) {
 }
 
 /**
- * 收集组件模块
+ * 收集组件模块 - 基于Git差异分析
  */
-async function collectComponentModules(users: any[]): Promise<ComponentModule[]> {
-  console.log(chalk.yellow('\n📋 第三步：组件模块 (可选)'));
+async function collectComponentModules(users: any[], gitInfo: any): Promise<ComponentModule[]> {
+  console.log(chalk.yellow('\n📋 第三步：组件模块 (基于Git差异智能分析)'));
 
   const userChoices = users.map(user => ({
     name: user.name,
     value: user.id
   }));
 
+  // 1. 获取Git差异分析
+  const gitUtils = new GitUtils();
+  const diffFiles = await gitUtils.getBranchDiffFiles();
+  const { suggestedComponents } = gitUtils.analyzeDiffForModules(diffFiles);
+
   const components: ComponentModule[] = [];
 
-  const { hasComponents } = await inquirer.prompt([{
+  if (suggestedComponents.length === 0) {
+    console.log(chalk.gray('📂 未检测到组件文件变更'));
+    
+    const { hasComponents } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'hasComponents',
+      message: '是否需要手动添加组件模块？',
+      default: false
+    }]);
+
+    if (!hasComponents) return components;
+
+    // 回退到手动添加模式
+    return await collectComponentsManually(userChoices);
+  }
+
+  console.log(chalk.blue(`🎯 检测到 ${suggestedComponents.length} 个组件变更文件`));
+
+  // 2. 智能选择界面
+  const componentChoices = suggestedComponents.map(comp => {
+    const statusIcon = getStatusIcon(comp.status);
+    const statusText = getStatusText(comp.status);
+    
+    return {
+      name: `${statusIcon} ${comp.relativePath} (${statusText})`,
+      value: comp,
+      checked: comp.status === 'A' || comp.status === 'M' // 新增和修改默认选中
+    };
+  });
+
+  if (componentChoices.length > 0) {
+    const { selectedComponents } = await inquirer.prompt([{
+      type: 'checkbox',
+      name: 'selectedComponents',
+      message: '选择需要包含的组件模块:',
+      choices: componentChoices,
+      pageSize: 12,
+      validate: (choices) => choices.length > 0 || '请至少选择一个组件或选择手动添加'
+    }]);
+
+    // 3. 为选中的组件分配审核人员
+    for (const suggestion of selectedComponents) {
+      let checkUser = userChoices.length > 0 ? userChoices[0].value : '1'; // 默认第一个用户
+
+      if (userChoices.length > 1) {
+        const { selectedUser } = await inquirer.prompt([{
+          type: 'list',
+          name: 'selectedUser',
+          message: `${suggestion.relativePath} - 选择审核人员:`,
+          choices: userChoices,
+          pageSize: 12
+        }]);
+        checkUser = selectedUser;
+      }
+
+      // 提取最后一层有意义的目录名作为组件名称
+      const pathParts = suggestion.relativePath.split('/');
+      let componentName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, ''); // 去掉扩展名
+      
+      // 如果是index文件，使用父目录名
+      if (componentName.toLowerCase() === 'index') {
+        componentName = pathParts[pathParts.length - 2] || 'index';
+      }
+      
+      components.push({
+        name: componentName,
+        relativePath: suggestion.relativePath,
+        checkUser: checkUser.toString(),
+        url: '' // 可以后续优化为自动推测
+      });
+    }
+  }
+
+  // 4. 询问是否手动添加更多组件
+  const { addMore } = await inquirer.prompt([{
     type: 'confirm',
-    name: 'hasComponents',
-    message: '是否需要添加组件模块？',
-    default: true
+    name: 'addMore',
+    message: '是否需要添加其他未检测到的组件？',
+    default: false
   }]);
 
-  if (!hasComponents) return components;
+  if (addMore) {
+    const manualComponents = await collectComponentsManually(userChoices);
+    components.push(...manualComponents);
+  }
 
+  return components;
+}
+
+/**
+ * 获取文件状态图标
+ */
+function getStatusIcon(status: 'A' | 'M' | 'D' | 'R' | 'C'): string {
+  switch (status) {
+    case 'A': return '🟢'; // 新增
+    case 'M': return '🟡'; // 修改
+    case 'D': return '🔴'; // 删除
+    case 'R': return '🔄'; // 重命名
+    case 'C': return '📋'; // 复制
+    default: return '❓';
+  }
+}
+
+/**
+ * 获取文件状态文本
+ */
+function getStatusText(status: 'A' | 'M' | 'D' | 'R' | 'C'): string {
+  switch (status) {
+    case 'A': return '新增';
+    case 'M': return '修改';
+    case 'D': return '删除';
+    case 'R': return '重命名';
+    case 'C': return '复制';
+    default: return '未知';
+  }
+}
+
+/**
+ * 手动添加组件模式 (备选方案)
+ */
+async function collectComponentsManually(userChoices: any[]): Promise<ComponentModule[]> {
+  const components: ComponentModule[] = [];
+  
   let addMore = true;
   while (addMore) {
-    console.log(chalk.cyan(`\n添加第 ${components.length + 1} 个组件:`));
+    console.log(chalk.cyan(`\n手动添加第 ${components.length + 1} 个组件:`));
     
     const component = await inquirer.prompt([
       {
@@ -414,7 +537,9 @@ async function collectComponentModules(users: any[]): Promise<ComponentModule[]>
         type: 'list',
         name: 'checkUser',
         message: '选择审核人员:',
-        choices: userChoices
+        choices: userChoices,
+        pageSize: 12,
+        when: userChoices.length > 0
       },
       {
         type: 'input',
@@ -439,25 +564,149 @@ async function collectComponentModules(users: any[]): Promise<ComponentModule[]>
 }
 
 /**
- * 收集功能模块
+ * 收集功能模块 - 基于Git差异分析
  */
-async function collectFunctionModules(): Promise<FunctionModule[]> {
-  console.log(chalk.yellow('\n📋 第四步：功能模块 (可选)'));
+async function collectFunctionModules(users: any[], gitInfo: any): Promise<FunctionModule[]> {
+  console.log(chalk.yellow('\n📋 第四步：功能模块 (基于Git差异智能分析)'));
+
+  const userChoices = users.map(user => ({
+    name: user.name,
+    value: user.id
+  }));
+
+  // 1. 获取Git差异分析
+  const gitUtils = new GitUtils();
+  const diffFiles = await gitUtils.getBranchDiffFiles();
+  const { suggestedFunctions } = gitUtils.analyzeDiffForModules(diffFiles);
 
   const functions: FunctionModule[] = [];
 
-  const { hasFunctions } = await inquirer.prompt([{
+  if (suggestedFunctions.length === 0) {
+    console.log(chalk.gray('📂 未检测到功能模块文件变更'));
+    
+    const { hasFunctions } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'hasFunctions',
+      message: '是否需要手动添加功能模块？',
+      default: false
+    }]);
+
+    if (!hasFunctions) return functions;
+
+    // 回退到手动添加模式
+    return await collectFunctionsManually();
+  }
+
+  console.log(chalk.blue(`🎯 检测到 ${suggestedFunctions.length} 个功能模块变更文件`));
+
+  // 2. 按分类分组显示
+  const categorizedSuggestions = suggestedFunctions.reduce((acc, func) => {
+    if (!acc[func.category]) acc[func.category] = [];
+    acc[func.category].push(func);
+    return acc;
+  }, {} as Record<string, FunctionSuggestion[]>);
+
+  const functionChoices: any[] = [];
+
+  // 添加分类分隔符和选项 (简化显示)
+  Object.entries(categorizedSuggestions).forEach(([category, funcs]) => {
+    const categoryName = getCategoryDisplayName(category);
+    functionChoices.push(new inquirer.Separator(`== ${categoryName} ==`));
+    
+    funcs.forEach(func => {
+      const statusIcon = getStatusIcon(func.status);
+      const statusText = getStatusText(func.status);
+      
+      functionChoices.push({
+        name: `${statusIcon} ${func.relativePath} (${statusText})`,
+        value: func,
+        checked: func.status === 'A' || func.status === 'M' // 新增和修改默认选中
+      });
+    });
+  });
+
+  if (functionChoices.length > 0) {
+    const { selectedFunctions } = await inquirer.prompt([{
+      type: 'checkbox',
+      name: 'selectedFunctions',
+      message: '选择需要包含的功能模块:',
+      choices: functionChoices,
+      pageSize: 12
+    }]);
+
+    // 3. 为选中的功能分配审核人员
+    for (const suggestion of selectedFunctions) {
+      let checkUser = userChoices.length > 0 ? userChoices[0].value : '1'; // 默认第一个用户
+
+      if (userChoices.length > 1) {
+        const { selectedUser } = await inquirer.prompt([{
+          type: 'list',
+          name: 'selectedUser',
+          message: `${suggestion.relativePath} - 选择审核人员:`,
+          choices: userChoices,
+          pageSize: 12
+        }]);
+        checkUser = selectedUser;
+      }
+
+      // 提取最后一层有意义的目录名作为功能名称
+      const pathParts = suggestion.relativePath.split('/');
+      let functionName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, ''); // 去掉扩展名
+      
+      // 如果是index文件，使用父目录名
+      if (functionName.toLowerCase() === 'index') {
+        functionName = pathParts[pathParts.length - 2] || 'index';
+      }
+      
+      functions.push({
+        name: functionName,
+        relativePath: suggestion.relativePath,
+        checkUser: checkUser.toString(),
+        description: suggestion.relativePath
+      });
+    }
+  }
+
+  // 4. 询问是否手动添加更多功能
+  const { addMore } = await inquirer.prompt([{
     type: 'confirm',
-    name: 'hasFunctions',
-    message: '是否需要添加功能模块？',
-    default: true
+    name: 'addMore',
+    message: '是否需要添加其他未检测到的功能？',
+    default: false
   }]);
 
-  if (!hasFunctions) return functions;
+  if (addMore) {
+    const manualFunctions = await collectFunctionsManually();
+    functions.push(...manualFunctions);
+  }
 
+  return functions;
+}
+
+/**
+ * 获取分类显示名称
+ */
+function getCategoryDisplayName(category: string): string {
+  const categoryNames: Record<string, string> = {
+    'pages': '页面模块',
+    'api': 'API服务',
+    'utils': '工具函数',
+    'store': '状态管理',
+    'features': '功能模块',
+    'other': '其他变更'
+  };
+  return categoryNames[category] || category;
+}
+
+/**
+ * 手动添加功能模式 (备选方案)
+ */
+async function collectFunctionsManually(): Promise<FunctionModule[]> {
+  const functions: FunctionModule[] = [];
+  
   let addMore = true;
   while (addMore) {
-    console.log(chalk.cyan(`\n添加第 ${functions.length + 1} 个功能:`));
+    console.log(chalk.cyan(`\n手动添加第 ${functions.length + 1} 个功能:`));
     
     const func = await inquirer.prompt([
       {
@@ -471,6 +720,13 @@ async function collectFunctionModules(): Promise<FunctionModule[]> {
         name: 'relativePath',
         message: '功能相对路径:',
         validate: (input) => input.trim().length > 0 || '请输入功能路径'
+      },
+      {
+        type: 'input',
+        name: 'checkUser',
+        message: '审核人员ID:',
+        default: '1',
+        validate: (input) => input.trim().length > 0 || '请输入审核人员ID'
       },
       {
         type: 'input',
