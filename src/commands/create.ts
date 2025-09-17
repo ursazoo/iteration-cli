@@ -6,7 +6,7 @@ import inquirer from 'inquirer';
 import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigManager } from '../utils/config.js';
-import { GitUtils, ComponentSuggestion, FunctionSuggestion } from '../utils/git.js';
+import { GitUtils, GitInfo, ComponentSuggestion, FunctionSuggestion } from '../utils/git.js';
 import { GreatWallApiClient } from '../lib/greatwall-client.js';
 import { GreatWallApiManager } from '../lib/greatwall-services.js';
 import {
@@ -40,17 +40,16 @@ export async function createIteration(options: CreateOptions) {
     // 3. 获取基础数据
     const { users, projectGroups } = await fetchBaseData(apiManager);
 
-    // 4. 开始交互式创建流程
-    const iterationData = await createIterationFlow(gitInfo, users, projectGroups, apiManager);
+    // 4. 创建迭代
+    const { sprintId, createUserId } = await createIterationOnly(users, projectGroups, gitInfo, apiManager);
 
-    console.log('🔍 createIterationFlow返回的数据:');
-    console.log('  sprintId:', iterationData.sprintId, '(类型:', typeof iterationData.sprintId, ')');
-    console.log('  iterationData keys:', Object.keys(iterationData));
+    console.log('🔍 创建的迭代ID:', sprintId, '(类型:', typeof sprintId, ')');
+    console.log('🔍 创建人ID:', createUserId, '(类型:', typeof createUserId, ')');
 
-    // 5. 创建CR申请单
-    await submitCrRequest(apiManager, iterationData.sprintId, iterationData);
+    // 5. 创建CR申请单（支持多个）
+    await createMultipleCrRequests(apiManager, sprintId, gitInfo, users, createUserId);
 
-    console.log(chalk.green.bold('\n🎉 迭代和CR申请单创建完成！'));
+    console.log(chalk.green.bold('\n🎉 迭代和所有CR申请单创建完成！'));
 
   } catch (error) {
     console.error(chalk.red.bold('\n❌ 迭代或CR申请单创建失败:'), (error as Error).message);
@@ -128,54 +127,31 @@ async function fetchBaseData(apiManager: GreatWallApiManager) {
 }
 
 /**
- * 交互式创建流程
+ * 只创建迭代，不处理CR申请单
  */
-async function createIterationFlow(gitInfo: any, users: any[], projectGroups: GreatWallProjectGroup[], apiManager: GreatWallApiManager) {
-  console.log(chalk.blue('\n📝 开始创建迭代和CR申请单...\n'));
+async function createIterationOnly(users: any[], projectGroups: GreatWallProjectGroup[], gitInfo: any, apiManager: GreatWallApiManager): Promise<{ sprintId: number; createUserId: number }> {
+  console.log(chalk.blue('\n📝 开始创建迭代...\n'));
 
-  // 第一步：基础信息收集
+  // 收集迭代基础信息
   const basicInfo = await collectBasicInfo(users, projectGroups, gitInfo);
-  
+
   // 立即创建迭代
   const sprintId = await createSprintImmediately(apiManager, basicInfo);
-  
-  // 第二步：项目信息收集
-  const projectInfo = await collectProjectInfo(users, gitInfo);
-  
-  // 第三步：组件模块收集
-  const componentModules = await collectComponentModules(users, gitInfo);
-  
-  // 第四步：功能模块收集
-  const functionModules = await collectFunctionModules(users, gitInfo);
-  
-  // 第五步：确认CR申请单信息
-  const confirmed = await confirmCrRequestInformation({
-    sprintId,
-    basicInfo,
-    projectInfo,
-    componentModules,
-    functionModules
-  });
-  
-  if (!confirmed) {
-    console.log(chalk.yellow('❌ CR申请单创建已取消'));
-    process.exit(0);
+
+  // 确保 createUserId 是有效的数字
+  const createUserId = parseInt(basicInfo.createUserId);
+  if (isNaN(createUserId)) {
+    throw new Error('创建人ID格式错误');
   }
 
-  return {
-    sprintId,
-    basicInfo,
-    projectInfo,
-    componentModules,
-    functionModules
-  };
+  return { sprintId, createUserId };
 }
 
 /**
  * 收集基础信息
  */
 async function collectBasicInfo(users: any[], projectGroups: GreatWallProjectGroup[], gitInfo: any) {
-  console.log(chalk.yellow('📋 第一步：基础信息 (收集后立即创建迭代)'));
+  console.log(chalk.yellow('📋 收集迭代基础信息'));
   
   const projectChoices = projectGroups.map(group => ({
     name: `${group.name} (ID: ${group.id})`,
@@ -378,7 +354,7 @@ async function collectProjectInfo(users: any[], gitInfo: any) {
 /**
  * 收集组件模块 - 基于Git差异分析
  */
-async function collectComponentModules(users: any[], gitInfo: any): Promise<ComponentModule[]> {
+async function collectComponentModules(users: any[], gitInfo: GitInfo, workDir?: string): Promise<ComponentModule[]> {
   console.log(chalk.yellow('\n📋 第三步：组件模块 (基于Git差异智能分析)'));
 
   const userChoices = users.map(user => ({
@@ -386,8 +362,9 @@ async function collectComponentModules(users: any[], gitInfo: any): Promise<Comp
     value: user.id
   }));
 
-  // 1. 获取Git差异分析
-  const gitUtils = new GitUtils();
+  // 1. 获取Git差异分析 - 使用正确的工作目录
+  const projectDir = workDir || gitInfo.projectDir || process.cwd();
+  const gitUtils = new GitUtils(projectDir);
   const diffFiles = await gitUtils.getBranchDiffFiles();
   const { suggestedComponents } = gitUtils.analyzeDiffForModules(diffFiles);
 
@@ -566,7 +543,7 @@ async function collectComponentsManually(userChoices: any[]): Promise<ComponentM
 /**
  * 收集功能模块 - 基于Git差异分析
  */
-async function collectFunctionModules(users: any[], gitInfo: any): Promise<FunctionModule[]> {
+async function collectFunctionModules(users: any[], gitInfo: GitInfo, workDir?: string): Promise<FunctionModule[]> {
   console.log(chalk.yellow('\n📋 第四步：功能模块 (基于Git差异智能分析)'));
 
   const userChoices = users.map(user => ({
@@ -574,8 +551,9 @@ async function collectFunctionModules(users: any[], gitInfo: any): Promise<Funct
     value: user.id
   }));
 
-  // 1. 获取Git差异分析
-  const gitUtils = new GitUtils();
+  // 1. 获取Git差异分析 - 使用正确的工作目录
+  const projectDir = workDir || gitInfo.projectDir || process.cwd();
+  const gitUtils = new GitUtils(projectDir);
   const diffFiles = await gitUtils.getBranchDiffFiles();
   const { suggestedFunctions } = gitUtils.analyzeDiffForModules(diffFiles);
 
@@ -795,71 +773,372 @@ async function confirmCrRequestInformation(data: any): Promise<boolean> {
 }
 
 /**
- * 创建CR申请单
+ * 获取项目Git信息 - 支持多种来源
  */
-async function submitCrRequest(apiManager: GreatWallApiManager, sprintId: number, iterationData: any) {
-  console.log('🔍 submitCrRequest函数接收的参数:');
-  console.log('  sprintId:', sprintId, '(类型:', typeof sprintId, ')');
-  console.log('  iterationData keys:', Object.keys(iterationData));
-  
-  if (!sprintId) {
-    throw new Error('submitCrRequest函数参数错误: sprintId为空或undefined');
+async function getProjectGitInfo(isFirstCr: boolean = false, currentGitInfo?: any): Promise<any> {
+  if (isFirstCr && currentGitInfo) {
+    // 第一个CR申请单，使用当前目录的Git信息
+    return currentGitInfo;
   }
-  
+
+  // 后续CR申请单，询问项目信息来源
+  const { projectSource } = await inquirer.prompt([{
+    type: 'list',
+    name: 'projectSource',
+    message: '选择项目信息来源:',
+    choices: [
+      { name: '📁 从其他项目目录获取Git信息', value: 'directory' },
+      { name: '✏️  手动输入项目信息', value: 'manual' },
+      { name: '🔄 继续使用当前目录（同项目不同模块）', value: 'current' }
+    ],
+    pageSize: 10
+  }]);
+
+  switch (projectSource) {
+    case 'directory':
+      return await getGitInfoFromDirectory();
+    case 'manual':
+      return await getManualProjectInfo();
+    case 'current':
+      return currentGitInfo ? {
+        ...currentGitInfo,
+        projectDir: process.cwd() // 当前目录
+      } : {};
+    default:
+      return {};
+  }
+}
+
+/**
+ * 从指定目录获取Git信息
+ */
+async function getGitInfoFromDirectory(): Promise<any> {
+  const { projectPath } = await inquirer.prompt([{
+    type: 'input',
+    name: 'projectPath',
+    message: '请输入项目目录路径:',
+    validate: (input) => {
+      if (!input.trim()) return '请输入有效路径';
+      return true;
+    }
+  }]);
+
+  try {
+    const projectDir = projectPath.trim();
+    const gitUtils = new GitUtils(projectDir);
+    const gitInfo = await gitUtils.getGitInfo();
+
+    if (!gitInfo.isGitRepository) {
+      console.log(chalk.yellow('⚠️  指定目录不是Git仓库，将使用手动输入模式'));
+      return await getManualProjectInfo();
+    }
+
+    console.log(chalk.green('✅ 成功获取项目Git信息:'));
+    console.log(`  项目名: ${chalk.cyan(gitInfo.projectName)}`);
+    console.log(`  分支: ${chalk.cyan(gitInfo.currentBranch)}`);
+    console.log(`  仓库: ${chalk.cyan(gitInfo.projectUrl)}`);
+
+    // 添加项目目录信息
+    return {
+      ...gitInfo,
+      projectDir: projectDir
+    };
+  } catch (error) {
+    console.log(chalk.red('❌ 获取Git信息失败:'), (error as Error).message);
+    console.log(chalk.yellow('回退到手动输入模式'));
+    return await getManualProjectInfo();
+  }
+}
+
+/**
+ * 手动输入项目信息
+ */
+async function getManualProjectInfo(): Promise<any> {
+  console.log(chalk.yellow('\n✏️  手动输入项目信息'));
+
+  const manualInfo = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'projectName',
+      message: '项目名称:',
+      validate: (input) => input.trim().length > 0 || '请输入项目名称'
+    },
+    {
+      type: 'input',
+      name: 'projectUrl',
+      message: 'Git仓库地址:',
+      validate: (input) => input.trim().length > 0 || '请输入仓库地址'
+    },
+    {
+      type: 'input',
+      name: 'currentBranch',
+      message: '分支名:',
+      default: 'main'
+    }
+  ]);
+
+  return {
+    projectName: manualInfo.projectName,
+    projectUrl: manualInfo.projectUrl,
+    currentBranch: manualInfo.currentBranch,
+    isGitRepository: false, // 标记为手动输入
+    projectDir: null // 手动输入模式没有具体的项目目录
+  };
+}
+
+/**
+ * 创建多个CR申请单
+ */
+async function createMultipleCrRequests(apiManager: GreatWallApiManager, sprintId: number, gitInfo: any, users: any[], createUserId: number) {
+  const allCrRequests: any[] = [];
+  let continueCrCreation = true;
+  let crRequestCount = 0;
+
+  console.log(chalk.blue.bold('\n📋 开始收集CR申请单信息'));
+  console.log(chalk.gray('═'.repeat(50)));
+
+  // 收集所有CR申请单信息
+  while (continueCrCreation) {
+    crRequestCount++;
+    console.log(chalk.yellow.bold(`\n🔍 收集第 ${crRequestCount} 个CR申请单信息`));
+
+    // 获取当前CR申请单的项目Git信息
+    const currentGitInfo = await getProjectGitInfo(crRequestCount === 1, gitInfo);
+
+    console.log(chalk.cyan(`📁 当前项目: ${currentGitInfo.projectName || '未知项目'}`));
+    if (currentGitInfo.currentBranch) {
+      console.log(chalk.cyan(`🌿 分支: ${currentGitInfo.currentBranch}`));
+    }
+
+    // 收集CR申请单的详细信息
+    const crData = await collectCrRequestData(users, currentGitInfo, sprintId, createUserId);
+    allCrRequests.push(crData);
+
+    console.log(chalk.green(`✅ 第 ${crRequestCount} 个CR申请单信息已收集`));
+
+    // 询问是否继续添加新的CR申请单
+    const { continueCreating } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'continueCreating',
+      message: `是否需要为当前迭代添加第 ${crRequestCount + 1} 个CR申请单？`,
+      default: false
+    }]);
+
+    continueCrCreation = continueCreating;
+  }
+
+  // 显示收集结果
+  console.log(chalk.blue.bold(`\n📊 共收集了 ${allCrRequests.length} 个CR申请单`));
+
+  // 确认是否创建
+  const { confirmCreate } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'confirmCreate',
+    message: `确认创建这 ${allCrRequests.length} 个CR申请单吗？`,
+    default: true
+  }]);
+
+  if (!confirmCreate) {
+    console.log(chalk.yellow('⚠️  已取消创建'));
+    return;
+  }
+
+  // 批量创建所有CR申请单
+  console.log(chalk.blue.bold('\n🚀 开始创建CR申请单...'));
+  console.log(chalk.gray('═'.repeat(50)));
+
+  let successCount = 0;
+  let failedCount = 0;
+
+  for (let i = 0; i < allCrRequests.length; i++) {
+    const crData = allCrRequests[i];
+    console.log(chalk.cyan(`\n正在创建第 ${i + 1}/${allCrRequests.length} 个CR申请单...`));
+    console.log(`  项目: ${crData.gitProjectName}`);
+    console.log(`  分支: ${crData.gitlabBranch}`);
+
+    try {
+      await submitSingleCrRequest(apiManager, sprintId, crData);
+      successCount++;
+      console.log(chalk.green(`✅ 第 ${i + 1} 个CR申请单创建成功`));
+    } catch (error) {
+      failedCount++;
+      console.log(chalk.red(`❌ 第 ${i + 1} 个CR申请单创建失败: ${(error as Error).message}`));
+    }
+  }
+
+  // 显示最终结果
+  console.log(chalk.blue.bold('\n📈 创建结果统计：'));
+  console.log(chalk.green(`  成功: ${successCount} 个`));
+  if (failedCount > 0) {
+    console.log(chalk.red(`  失败: ${failedCount} 个`));
+  }
+  console.log(chalk.cyan(`  总计: ${allCrRequests.length} 个CR申请单`));
+}
+
+/**
+ * 收集单个CR申请单的数据
+ */
+async function collectCrRequestData(users: any[], gitInfo: any, sprintId: number, createUserId: number) {
+  console.log(chalk.yellow('\n📋 收集CR申请单信息'));
+
+  // 显示当前项目信息来源
+  if (gitInfo.isGitRepository === false) {
+    console.log(chalk.gray('📝 基于手动输入的项目信息'));
+  } else if (gitInfo.isGitRepository) {
+    console.log(chalk.gray('📁 基于Git仓库信息'));
+  }
+
+  // 1. 基础项目信息
+  const projectInfo = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'gitProjectName',
+      message: 'Git项目名称:',
+      default: gitInfo.projectName || '',
+      validate: (input) => input.trim().length > 0 || '请输入项目名称'
+    },
+    {
+      type: 'input',
+      name: 'gitlabBranch',
+      message: 'Git分支名:',
+      default: gitInfo.currentBranch || 'main',
+      validate: (input) => input.trim().length > 0 || '请输入分支名'
+    },
+    {
+      type: 'input',
+      name: 'gitlabUrl',
+      message: 'Git仓库地址:',
+      default: gitInfo.projectUrl || '',
+      validate: (input) => input.trim().length > 0 || '请输入仓库地址'
+    },
+    {
+      type: 'input',
+      name: 'reqDocUrl',
+      message: '产品文档链接:',
+      default: '-'
+    },
+    {
+      type: 'input',
+      name: 'spendTime',
+      message: '预估工时 (小时):',
+      default: '8',
+      validate: (input) => !isNaN(Number(input)) || '请输入有效数字'
+    }
+  ]);
+
+  // 2. 人员选择
+  const userChoices = users.map(user => ({
+    name: user.name,
+    value: user.id.toString()
+  }));
+
+  const personnelInfo = await inquirer.prompt([
+    {
+      type: 'checkbox',
+      name: 'participantIds',
+      message: '选择参与人员:',
+      choices: userChoices,
+      validate: (choices) => choices.length > 0 || '请至少选择一个参与人员'
+    },
+    {
+      type: 'checkbox',
+      name: 'checkUserIds',
+      message: '选择审核人员:',
+      choices: userChoices,
+      validate: (choices) => choices.length > 0 || '请至少选择一个审核人员'
+    }
+  ]);
+
+  // 3. 收集组件模块 - 传递正确的项目目录
+  const componentModules = await collectComponentModules(users, gitInfo, gitInfo.projectDir);
+
+  // 4. 收集功能模块 - 传递正确的项目目录
+  const functionModules = await collectFunctionModules(users, gitInfo, gitInfo.projectDir);
+
+  return {
+    ...projectInfo,
+    participantIds: personnelInfo.participantIds.join(','),
+    checkUserIds: personnelInfo.checkUserIds.join(','),
+    componentList: componentModules,
+    functionList: functionModules,
+    sprintId,
+    createUserId
+  };
+}
+
+/**
+ * 创建单个CR申请单
+ */
+async function submitSingleCrRequest(apiManager: GreatWallApiManager, sprintId: number, crData: any) {
+  console.log('🔍 submitSingleCrRequest函数接收的参数:');
+  console.log('  sprintId:', sprintId, '(类型:', typeof sprintId, ')');
+  console.log('  crData keys:', Object.keys(crData));
+
+  // 验证必需的字段
+  if (!sprintId) {
+    throw new Error('submitSingleCrRequest函数参数错误: sprintId为空或undefined');
+  }
+  if (!crData.createUserId) {
+    throw new Error('submitSingleCrRequest函数参数错误: createUserId为空或undefined');
+  }
+  if (!crData.gitProjectName) {
+    throw new Error('submitSingleCrRequest函数参数错误: gitProjectName为空或undefined');
+  }
+
   const spinner = ora('创建CR申请单...').start();
-  
+
   try {
     // 转换组件数据格式
-    const componentList = iterationData.componentModules.map((comp: any) => ({
+    const componentList = crData.componentList.map((comp: any) => ({
       name: comp.name,
       address: comp.relativePath,
       auditId: parseInt(comp.checkUser),
       imgUrl: comp.url || '-'
     }));
-    
+
     // 转换功能数据格式
-    const functionList = iterationData.functionModules.map((func: any) => ({
+    const functionList = crData.functionList.map((func: any) => ({
       name: func.name,
-      auditId: parseInt(func.checkUser || iterationData.projectInfo.checkUsers[0]),
+      auditId: parseInt(func.checkUser || crData.checkUserIds.split(',')[0]),
       desc: func.description || func.name
     }));
-    
+
     const crRequestParams = {
       sprintId: sprintId,
-      createUserId: parseInt(iterationData.basicInfo.createUserId),
-      gitProjectName: iterationData.projectInfo.gitProjectName,
-      gitlabBranch: iterationData.projectInfo.developmentBranch,
-      reqDocUrl: iterationData.projectInfo.productDoc || '-',
-      techDocUrl: iterationData.projectInfo.technicalDoc || '-',
-      projexUrl: iterationData.projectInfo.projectDashboard || '-',
-      uxDocUrl: iterationData.projectInfo.designDoc || '-',
-      gitlabUrl: iterationData.projectInfo.gitProjectUrl,
-      spendTime: iterationData.projectInfo.workHours.toString(),
-      participantIds: iterationData.projectInfo.participants.join(','),
-      checkUserIds: iterationData.projectInfo.checkUsers.join(','),
-      remark: iterationData.projectInfo.remarks || '',
+      createUserId: crData.createUserId,
+      gitProjectName: crData.gitProjectName,
+      gitlabBranch: crData.gitlabBranch,
+      reqDocUrl: crData.reqDocUrl || '-',
+      techDocUrl: '-',
+      projexUrl: '-',
+      uxDocUrl: '-',
+      gitlabUrl: crData.gitlabUrl,
+      spendTime: crData.spendTime,
+      participantIds: crData.participantIds,
+      checkUserIds: crData.checkUserIds,
+      remark: '-',
       componentList,
       functionList
     };
-    
+
     console.log(chalk.yellow('🔍 调用createCrRequest接口的参数:'));
     console.log('传入的sprintId:', sprintId);
     console.log('构造的crRequestParams:', JSON.stringify(crRequestParams, null, 2));
-    
+
     await apiManager.project.createCrRequest(crRequestParams);
-    
+
     spinner.succeed('CR申请单创建成功');
-    
+
     // 显示结果
     console.log(chalk.green('\n✅ CR申请单创建结果:'));
     console.log(`  关联迭代ID: ${chalk.cyan(sprintId)}`);
-    console.log(`  Git项目: ${chalk.cyan(iterationData.projectInfo.gitProjectName)}`);
-    console.log(`  开发分支: ${chalk.cyan(iterationData.projectInfo.developmentBranch)}`);
+    console.log(`  Git项目: ${chalk.cyan(crData.gitProjectName)}`);
+    console.log(`  开发分支: ${chalk.cyan(crData.gitlabBranch)}`);
     console.log(`  组件数量: ${chalk.cyan(componentList.length)} 个`);
     console.log(`  功能数量: ${chalk.cyan(functionList.length)} 个`);
-    console.log(`  参与人员: ${chalk.cyan(iterationData.projectInfo.participants.length)} 人`);
-    console.log(`  审核人员: ${chalk.cyan(iterationData.projectInfo.checkUsers.length)} 人`);
-    
+    console.log(`  参与人员: ${chalk.cyan(crData.participantIds.split(',').length)} 人`);
+    console.log(`  审核人员: ${chalk.cyan(crData.checkUserIds.split(',').length)} 人`);
+
   } catch (error) {
     spinner.fail('CR申请单创建失败');
     console.error(chalk.red('\n错误详情:'), (error as Error).message);
