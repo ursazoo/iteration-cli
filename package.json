@@ -1,8 +1,8 @@
 {
-  "name": "fshows-iteration-cli",
+  "name": "@asthestarslept/iteration-cli",
   "version": "1.0.0",
   "description": "长城后端迭代管理CLI工具",
-  "main": "dist/index.js",
+  "main": "dist/cli.js",
   "type": "module",
   "bin": {
     "fiter": "./bin/fiter.js"
@@ -16,11 +16,20 @@
   "keywords": [
     "iteration",
     "cli",
-    "fshows",
-    "greatwall"
+    "code-review",
+    "project-management",
+    "development-tools"
   ],
   "author": "cqf",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ursazoo/iteration-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ursazoo/iteration-cli/issues"
+  },
+  "homepage": "https://github.com/ursazoo/iteration-cli#readme",
   "dependencies": {
     "commander": "^11.1.0",
     "inquirer": "^9.2.12",
