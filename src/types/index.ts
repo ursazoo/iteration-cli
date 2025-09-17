@@ -9,7 +9,7 @@ export interface IterationBasicInfo {
   projectLine: string;        // 所属项目线
   iterationName: string;      // 迭代名称
   onlineTime: string;         // 上线时间
-  creatorId?: string;         // 创建人ID
+  createUserId: string;       // 创建人ID（字符串形式，来自inquirer）
   remarks?: string;           // 备注
 }
 
@@ -114,6 +114,7 @@ export interface GreatWallCreateSprintParams {
 // 长城后端CR申请单创建参数
 export interface GreatWallCreateCrRequestParams {
   sprintId: number;
+  createUserId: number;      // 创建人ID（服务调用时必需）
   gitProjectName: string;
   gitlabBranch: string;
   reqDocUrl: string;

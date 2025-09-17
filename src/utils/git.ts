@@ -10,6 +10,7 @@ export interface GitInfo {
   projectName: string;
   currentBranch: string;
   isGitRepository: boolean;
+  projectDir?: string;    // 项目目录路径
   lastCommitHash?: string;
   lastCommitMessage?: string;
   lastCommitAuthor?: string;
@@ -114,6 +115,7 @@ export class GitUtils {
         projectName: projectName,
         currentBranch: branchName,
         isGitRepository: true,
+        projectDir: this.workDir,
         ...lastCommitInfo
       };
 
