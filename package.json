@@ -19,7 +19,7 @@
     "fshows",
     "greatwall"
   ],
-  "author": "rabbitsbear",
+  "author": "cqf",
   "license": "MIT",
   "dependencies": {
     "commander": "^11.1.0",

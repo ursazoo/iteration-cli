@@ -39,7 +39,7 @@ program.exitOverride((err) => {
   if (err.code === 'commander.version') {
     process.exit(0);
   }
-  if (err.code === 'commander.help') {
+  if (err.code === 'commander.help' || err.code === 'commander.helpDisplayed') {
     process.exit(0);
   }
   console.error(chalk.red('❌ 命令执行失败:'), err.message);
