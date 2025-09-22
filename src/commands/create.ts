@@ -6,6 +6,9 @@ import inquirer from 'inquirer';
 import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigManager } from '../utils/config.js';
+import { UserCacheManager } from '../utils/cache.js';
+import { BatchReviewerAssignment } from '../utils/batch-assignment.js';
+import { UserDetector } from '../utils/user-detector.js';
 import { GitUtils, GitInfo, ComponentSuggestion, FunctionSuggestion } from '../utils/git.js';
 import { GreatWallApiClient } from '../lib/greatwall-client.js';
 import { GreatWallApiManager } from '../lib/greatwall-services.js';
@@ -18,6 +21,9 @@ import {
 } from '../types/index.js';
 
 const configManager = new ConfigManager();
+const cacheManager = new UserCacheManager();
+const batchAssignment = new BatchReviewerAssignment();
+const userDetector = new UserDetector();
 
 interface CreateOptions {
   dir?: string;
@@ -158,10 +164,25 @@ async function collectBasicInfo(users: any[], projectGroups: GreatWallProjectGro
     value: group.id
   }));
 
-  const userChoices = users.map(user => ({
-    name: `${user.name} (ID: ${user.id})`,
-    value: user.id
-  }));
+  // 尝试获取保存的创建人信息
+  const savedCreator = await userDetector.getSavedCreator();
+  let createUserId: number;
+
+  if (savedCreator) {
+    // 验证保存的用户是否还在用户列表中
+    const userExists = users.find(user => user.id === savedCreator.id);
+    if (userExists) {
+      createUserId = savedCreator.id;
+      console.log(chalk.green(`✅ 创建人: ${savedCreator.name} (自动使用保存的用户)`));
+    } else {
+      console.log(chalk.yellow(`⚠️ 保存的用户 ${savedCreator.name} 不在当前用户列表中，请重新选择`));
+      createUserId = await selectCreatorManually(users);
+    }
+  } else {
+    // 第一次使用，手动选择并保存
+    console.log(chalk.blue('🔍 首次使用，请选择创建人（选择后会保存到本机）'));
+    createUserId = await selectCreatorManually(users);
+  }
 
   const answers = await inquirer.prompt([
     {
@@ -201,21 +222,47 @@ async function collectBasicInfo(users: any[], projectGroups: GreatWallProjectGro
       }
     },
     {
-      type: 'list',
-      name: 'createUserId',
-      message: '选择创建人:',
-      choices: userChoices,
-      pageSize: 12,
-      when: userChoices.length > 0
-    },
-    {
       type: 'input',
       name: 'remarks',
       message: '备注信息 (可选):'
     }
   ]);
 
+  // 添加创建人ID到答案中
+  (answers as any).createUserId = createUserId;
+
   return answers as IterationBasicInfo;
+}
+
+/**
+ * 手动选择创建人并保存
+ */
+async function selectCreatorManually(users: any[]): Promise<number> {
+  const userChoices = users.map(user => ({
+    name: `${user.name} (ID: ${user.id})`,
+    value: user.id,
+    short: user.name
+  }));
+
+  const { selectedCreator } = await inquirer.prompt([{
+    type: 'list',
+    name: 'selectedCreator',
+    message: '选择创建人:',
+    choices: userChoices,
+    pageSize: 12
+  }]);
+
+  // 保存选择的创建人
+  const selectedUser = users.find(user => user.id === selectedCreator);
+  if (selectedUser) {
+    await userDetector.saveCreator({
+      id: selectedUser.id,
+      name: selectedUser.name
+    });
+    console.log(chalk.green(`💾 已保存创建人信息: ${selectedUser.name}`));
+  }
+
+  return selectedCreator;
 }
 
 /**
@@ -238,12 +285,9 @@ async function createSprintImmediately(apiManager: GreatWallApiManager, basicInf
     // console.log('构造的sprintParams:', JSON.stringify(sprintParams, null, 2));
     
     const sprintResult = await apiManager.project.createSprint(sprintParams);
-    console.log('🔍 完整的API响应结构:', JSON.stringify(sprintResult, null, 2));
     
     // HTTP客户端已经解包了data字段，直接访问sprintResult.id
     const sprintId = sprintResult.id;
-    console.log('🔍 提取的sprintId:', sprintId);
-    console.log('🔍 sprintResult对象keys:', Object.keys(sprintResult));
     
     if (!sprintId) {
       spinner.fail('迭代创建失败: 无法获取迭代ID');
@@ -270,10 +314,7 @@ async function createSprintImmediately(apiManager: GreatWallApiManager, basicInf
 async function collectProjectInfo(users: any[], gitInfo: any) {
   console.log(chalk.yellow('\n📋 第二步：项目信息 (为CR申请单收集详细信息)'));
 
-  const userChoices = users.map(user => ({
-    name: user.name,
-    value: user.id
-  }));
+  const userChoices = await cacheManager.generateSmartUserChoices(users, 'participants');
 
   const answers = await inquirer.prompt([
     {
@@ -357,10 +398,7 @@ async function collectProjectInfo(users: any[], gitInfo: any) {
 async function collectComponentModules(users: any[], gitInfo: GitInfo, workDir?: string): Promise<ComponentModule[]> {
   console.log(chalk.yellow('\n📋 第三步：组件模块 (基于Git差异智能分析)'));
 
-  const userChoices = users.map(user => ({
-    name: user.name,
-    value: user.id
-  }));
+  const userChoices = await cacheManager.generateSmartUserChoices(users, 'checkUsers');
 
   // 1. 获取Git差异分析 - 使用正确的工作目录
   const projectDir = workDir || gitInfo.projectDir || process.cwd();
@@ -410,36 +448,86 @@ async function collectComponentModules(users: any[], gitInfo: GitInfo, workDir?:
       validate: (choices) => choices.length > 0 || '请至少选择一个组件或选择手动添加'
     }]);
 
-    // 3. 为选中的组件分配审核人员
-    for (const suggestion of selectedComponents) {
-      let checkUser = userChoices.length > 0 ? userChoices[0].value : '1'; // 默认第一个用户
-
-      if (userChoices.length > 1) {
-        const { selectedUser } = await inquirer.prompt([{
-          type: 'list',
-          name: 'selectedUser',
-          message: `${suggestion.relativePath} - 选择审核人员:`,
-          choices: userChoices,
-          pageSize: 12
-        }]);
-        checkUser = selectedUser;
-      }
-
-      // 提取最后一层有意义的目录名作为组件名称
-      const pathParts = suggestion.relativePath.split('/');
-      let componentName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, ''); // 去掉扩展名
+    // 3. 批量分配审核人员（支持重试）
+    let batchAssignmentCompleted = false;
+    
+    while (!batchAssignmentCompleted) {
+      const batchOptions = await batchAssignment.collectBatchAssignmentMode(selectedComponents, userChoices);
       
-      // 如果是index文件，使用父目录名
-      if (componentName.toLowerCase() === 'index') {
-        componentName = pathParts[pathParts.length - 2] || 'index';
+      if (batchOptions.mode === 'individual') {
+        // 传统逐个选择模式
+        for (const suggestion of selectedComponents) {
+          let checkUser = userChoices.length > 0 ? userChoices[0].value : '1';
+
+          if (userChoices.length > 1) {
+            const { selectedUser } = await inquirer.prompt([{
+              type: 'list',
+              name: 'selectedUser',
+              message: `${suggestion.relativePath} - 选择审核人员:`,
+              choices: userChoices,
+              pageSize: 12
+            }]);
+            checkUser = selectedUser;
+          }
+
+          const pathParts = suggestion.relativePath.split('/');
+          let componentName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, '');
+          
+          if (componentName.toLowerCase() === 'index') {
+            componentName = pathParts[pathParts.length - 2] || 'index';
+          }
+          
+          components.push({
+            name: componentName,
+            relativePath: suggestion.relativePath,
+            checkUser: checkUser.toString(),
+            url: ''
+          });
+        }
+        batchAssignmentCompleted = true;
+        
+      } else {
+        // 批量分配模式
+        const assignmentResults = await batchAssignment.executeBatchAssignment(selectedComponents, batchOptions, userChoices);
+        
+        // 显示分配预览并获取用户选择
+        const previewResult = await batchAssignment.showAssignmentPreview(assignmentResults);
+        
+        if (previewResult === 'confirmed') {
+          // 支持个别调整
+          const finalResults = await batchAssignment.adjustIndividualAssignments(assignmentResults, userChoices);
+          
+          // 转换为组件模块格式
+          finalResults.forEach(result => {
+            const pathParts = result.filePath.split('/');
+            let componentName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, '');
+            
+            if (componentName.toLowerCase() === 'index') {
+              componentName = pathParts[pathParts.length - 2] || 'index';
+            }
+            
+            components.push({
+              name: componentName,
+              relativePath: result.filePath,
+              checkUser: result.reviewerId.toString(),
+              url: ''
+            });
+          });
+
+          console.log(chalk.green(`\n✅ 已完成 ${finalResults.length} 个组件的审查人员分配`));
+          batchAssignmentCompleted = true;
+          
+        } else if (previewResult === 'retry') {
+          console.log(chalk.blue('\n🔄 重新选择分配方式...'));
+          // 继续循环，重新选择分配方式
+          
+        } else {
+          // cancel
+          console.log(chalk.yellow('⚠️ 批量分配已取消'));
+          batchAssignmentCompleted = true;
+          return components;
+        }
       }
-      
-      components.push({
-        name: componentName,
-        relativePath: suggestion.relativePath,
-        checkUser: checkUser.toString(),
-        url: '' // 可以后续优化为自动推测
-      });
     }
   }
 
@@ -546,10 +634,7 @@ async function collectComponentsManually(userChoices: any[]): Promise<ComponentM
 async function collectFunctionModules(users: any[], gitInfo: GitInfo, workDir?: string): Promise<FunctionModule[]> {
   console.log(chalk.yellow('\n📋 第四步：功能模块 (基于Git差异智能分析)'));
 
-  const userChoices = users.map(user => ({
-    name: user.name,
-    value: user.id
-  }));
+  const userChoices = await cacheManager.generateSmartUserChoices(users, 'checkUsers');
 
   // 1. 获取Git差异分析 - 使用正确的工作目录
   const projectDir = workDir || gitInfo.projectDir || process.cwd();
@@ -612,36 +697,86 @@ async function collectFunctionModules(users: any[], gitInfo: GitInfo, workDir?: 
       pageSize: 12
     }]);
 
-    // 3. 为选中的功能分配审核人员
-    for (const suggestion of selectedFunctions) {
-      let checkUser = userChoices.length > 0 ? userChoices[0].value : '1'; // 默认第一个用户
-
-      if (userChoices.length > 1) {
-        const { selectedUser } = await inquirer.prompt([{
-          type: 'list',
-          name: 'selectedUser',
-          message: `${suggestion.relativePath} - 选择审核人员:`,
-          choices: userChoices,
-          pageSize: 12
-        }]);
-        checkUser = selectedUser;
-      }
-
-      // 提取最后一层有意义的目录名作为功能名称
-      const pathParts = suggestion.relativePath.split('/');
-      let functionName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, ''); // 去掉扩展名
+    // 3. 批量分配审核人员（支持重试）
+    let batchAssignmentCompleted = false;
+    
+    while (!batchAssignmentCompleted) {
+      const batchOptions = await batchAssignment.collectBatchAssignmentMode(selectedFunctions, userChoices);
       
-      // 如果是index文件，使用父目录名
-      if (functionName.toLowerCase() === 'index') {
-        functionName = pathParts[pathParts.length - 2] || 'index';
+      if (batchOptions.mode === 'individual') {
+        // 传统逐个选择模式
+        for (const suggestion of selectedFunctions) {
+          let checkUser = userChoices.length > 0 ? userChoices[0].value : '1';
+
+          if (userChoices.length > 1) {
+            const { selectedUser } = await inquirer.prompt([{
+              type: 'list',
+              name: 'selectedUser',
+              message: `${suggestion.relativePath} - 选择审核人员:`,
+              choices: userChoices,
+              pageSize: 12
+            }]);
+            checkUser = selectedUser;
+          }
+
+          const pathParts = suggestion.relativePath.split('/');
+          let functionName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, '');
+          
+          if (functionName.toLowerCase() === 'index') {
+            functionName = pathParts[pathParts.length - 2] || 'index';
+          }
+          
+          functions.push({
+            name: functionName,
+            relativePath: suggestion.relativePath,
+            checkUser: checkUser.toString(),
+            description: suggestion.relativePath
+          });
+        }
+        batchAssignmentCompleted = true;
+        
+      } else {
+        // 批量分配模式
+        const assignmentResults = await batchAssignment.executeBatchAssignment(selectedFunctions, batchOptions, userChoices);
+        
+        // 显示分配预览并获取用户选择
+        const previewResult = await batchAssignment.showAssignmentPreview(assignmentResults);
+        
+        if (previewResult === 'confirmed') {
+          // 支持个别调整
+          const finalResults = await batchAssignment.adjustIndividualAssignments(assignmentResults, userChoices);
+          
+          // 转换为功能模块格式
+          finalResults.forEach(result => {
+            const pathParts = result.filePath.split('/');
+            let functionName = pathParts[pathParts.length - 1].replace(/\.[^/.]+$/, '');
+            
+            if (functionName.toLowerCase() === 'index') {
+              functionName = pathParts[pathParts.length - 2] || 'index';
+            }
+            
+            functions.push({
+              name: functionName,
+              relativePath: result.filePath,
+              checkUser: result.reviewerId.toString(),
+              description: result.filePath
+            });
+          });
+
+          console.log(chalk.green(`\n✅ 已完成 ${finalResults.length} 个功能模块的审查人员分配`));
+          batchAssignmentCompleted = true;
+          
+        } else if (previewResult === 'retry') {
+          console.log(chalk.blue('\n🔄 重新选择分配方式...'));
+          // 继续循环，重新选择分配方式
+          
+        } else {
+          // cancel
+          console.log(chalk.yellow('⚠️ 批量分配已取消'));
+          batchAssignmentCompleted = true;
+          return functions;
+        }
       }
-      
-      functions.push({
-        name: functionName,
-        relativePath: suggestion.relativePath,
-        checkUser: checkUser.toString(),
-        description: suggestion.relativePath
-      });
     }
   }
 
@@ -931,12 +1066,20 @@ async function createMultipleCrRequests(apiManager: GreatWallApiManager, sprintI
   console.log(chalk.blue.bold(`\n📊 共收集了 ${allCrRequests.length} 个CR申请单`));
 
   // 确认是否创建
-  const { confirmCreate } = await inquirer.prompt([{
-    type: 'confirm',
-    name: 'confirmCreate',
-    message: `确认创建这 ${allCrRequests.length} 个CR申请单吗？`,
-    default: true
+  const { confirmInput } = await inquirer.prompt([{
+    type: 'input',
+    name: 'confirmInput',
+    message: `确认创建这 ${allCrRequests.length} 个CR申请单吗？(请输入 yes 或 no):`,
+    validate: (input: string) => {
+      const trimmed = input.trim().toLowerCase();
+      if (trimmed === 'yes' || trimmed === 'no' || trimmed === 'y' || trimmed === 'n') {
+        return true;
+      }
+      return '请输入 yes/y 或 no/n';
+    }
   }]);
+
+  const confirmCreate = ['yes', 'y'].includes(confirmInput.trim().toLowerCase());
 
   if (!confirmCreate) {
     console.log(chalk.yellow('⚠️  已取消创建'));
@@ -1027,27 +1170,39 @@ async function collectCrRequestData(users: any[], gitInfo: any, sprintId: number
   ]);
 
   // 2. 人员选择
-  const userChoices = users.map(user => ({
-    name: user.name,
-    value: user.id.toString()
-  }));
+  const participantChoices = await cacheManager.generateSmartUserChoices(users, 'participants');
+  const checkUserChoices = await cacheManager.generateSmartUserChoices(users, 'checkUsers');
+
+  // 获取上次选择的用户作为默认选项
+  const lastParticipants = await cacheManager.getLastSelectedUsers('participants');
+  const lastCheckUsers = await cacheManager.getLastSelectedUsers('checkUsers');
 
   const personnelInfo = await inquirer.prompt([
     {
       type: 'checkbox',
       name: 'participantIds',
       message: '选择参与人员:',
-      choices: userChoices,
+      choices: participantChoices.map(choice => ({
+        ...choice,
+        checked: lastParticipants.includes(choice.value)
+      })),
       validate: (choices) => choices.length > 0 || '请至少选择一个参与人员'
     },
     {
       type: 'checkbox',
       name: 'checkUserIds',
       message: '选择审核人员:',
-      choices: userChoices,
+      choices: checkUserChoices.map(choice => ({
+        ...choice,
+        checked: lastCheckUsers.includes(choice.value)
+      })),
       validate: (choices) => choices.length > 0 || '请至少选择一个审核人员'
     }
   ]);
+
+  // 更新用户选择缓存
+  await cacheManager.updateParticipantUsage(personnelInfo.participantIds.map((id: any) => parseInt(id)));
+  await cacheManager.updateCheckUserUsage(personnelInfo.checkUserIds.map((id: any) => parseInt(id)));
 
   // 3. 收集组件模块 - 传递正确的项目目录
   const componentModules = await collectComponentModules(users, gitInfo, gitInfo.projectDir);
