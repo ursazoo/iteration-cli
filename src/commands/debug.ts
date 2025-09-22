@@ -6,13 +6,19 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import * as os from 'os';
-import * as fs from 'fs-extra';
+import * as path from 'path';
+import fs from 'fs-extra';
+import inquirer from 'inquirer';
 import { ConfigManager } from '../utils/config.js';
+import { UserCacheManager } from '../utils/cache.js';
+import { UserDetector } from '../utils/user-detector.js';
 import { GitUtils } from '../utils/git.js';
 import { GreatWallApiClient } from '../lib/greatwall-client.js';
 import { GreatWallApiManager } from '../lib/greatwall-services.js';
 
 const configManager = new ConfigManager();
+const cacheManager = new UserCacheManager();
+const userDetector = new UserDetector();
 
 export const debugCmd = new Command('debug');
 
@@ -154,4 +160,160 @@ debugCmd
         console.log(`${pkg}: ${chalk.red('未安装')}`);
       }
     });
+  });
+
+// 用户缓存调试
+debugCmd
+  .command('cache')
+  .description('显示用户选择缓存状态')
+  .action(async () => {
+    try {
+      console.log(chalk.blue('📊 用户选择缓存状态:'));
+      console.log(chalk.gray('─'.repeat(50)));
+      
+      const stats = await cacheManager.getCacheStats();
+      
+      console.log(`缓存的参与人员: ${chalk.cyan(stats.participantCount)} 个`);
+      console.log(`缓存的审核人员: ${chalk.cyan(stats.checkUserCount)} 个`);
+      console.log(`文件类型偏好: ${stats.hasFilePreferences ? chalk.green('已建立') : chalk.gray('未建立')}`);
+      console.log(`最后更新时间: ${chalk.cyan(stats.lastUpdated)}`);
+      
+      if (stats.participantCount === 0 && stats.checkUserCount === 0) {
+        console.log(chalk.yellow('\n💡 提示: 缓存为空，使用 fiter create 后会自动建立缓存'));
+      } else {
+        console.log(chalk.green('\n✅ 缓存正常，下次选择人员时会优先显示常用人员'));
+      }
+      
+    } catch (error) {
+      console.error(chalk.red('❌ 缓存检查失败:'), (error as Error).message);
+    }
+  });
+
+// 保存的用户调试
+debugCmd
+  .command('user')
+  .description('显示和管理保存的创建人信息')
+  .option('--clear', '清除保存的创建人信息')
+  .action(async (options) => {
+    try {
+      if (options.clear) {
+        await userDetector.clearSavedCreator();
+        console.log(chalk.green('✅ 已清除保存的创建人信息'));
+        return;
+      }
+
+      console.log(chalk.blue('👤 保存的创建人信息:'));
+      console.log(chalk.gray('─'.repeat(50)));
+      
+      const savedCreator = await userDetector.getSavedCreator();
+      
+      if (savedCreator) {
+        console.log(`姓名: ${chalk.cyan(savedCreator.name)}`);
+        console.log(`ID: ${chalk.cyan(savedCreator.id)}`);
+        console.log(chalk.green('\n✅ 下次创建迭代时会自动使用此用户'));
+        console.log(chalk.gray('💡 如需更换创建人，请运行: fiter debug user --clear'));
+      } else {
+        console.log(chalk.yellow('⚠️ 未保存创建人信息'));
+        console.log(chalk.gray('💡 首次运行 fiter create 时会要求选择并保存创建人'));
+      }
+      
+    } catch (error) {
+      console.error(chalk.red('❌ 用户信息检查失败:'), (error as Error).message);
+    }
+  });
+
+// 重置所有缓存和配置
+debugCmd
+  .command('reset')
+  .description('清空所有缓存和配置，重新初始化')
+  .option('--confirm', '跳过确认直接重置')
+  .action(async (options) => {
+    try {
+      // 如果没有 --confirm 选项，先询问确认
+      if (!options.confirm) {
+        const { confirmed } = await inquirer.prompt([{
+          type: 'confirm',
+          name: 'confirmed',
+          message: chalk.yellow('⚠️  这将清空所有缓存和配置，确定要重置吗？'),
+          default: false
+        }]);
+
+        if (!confirmed) {
+          console.log(chalk.gray('已取消重置操作'));
+          return;
+        }
+      }
+
+      console.log(chalk.blue('🔄 开始重置所有缓存和配置...'));
+      console.log(chalk.gray('─'.repeat(50)));
+
+      let resetCount = 0;
+      let errorCount = 0;
+
+      // 1. 清除用户选择缓存
+      try {
+        await cacheManager.cleanExpiredCache();
+        console.log(chalk.green('✅ 用户选择缓存已清除'));
+        resetCount++;
+      } catch (error) {
+        console.log(chalk.red('❌ 清除用户选择缓存失败:'), (error as Error).message);
+        errorCount++;
+      }
+
+      // 2. 清除保存的创建人信息
+      try {
+        await userDetector.clearSavedCreator();
+        console.log(chalk.green('✅ 保存的创建人信息已清除'));
+        resetCount++;
+      } catch (error) {
+        console.log(chalk.red('❌ 清除创建人信息失败:'), (error as Error).message);
+        errorCount++;
+      }
+
+      // 3. 清除配置文件（如果存在）
+      try {
+        const configPath = configManager.getConfigPath();
+        if (await fs.pathExists(configPath)) {
+          await fs.remove(configPath);
+          console.log(chalk.green('✅ 配置文件已清除'));
+          resetCount++;
+        } else {
+          console.log(chalk.gray('ℹ️  配置文件不存在，跳过'));
+        }
+      } catch (error) {
+        console.log(chalk.red('❌ 清除配置文件失败:'), (error as Error).message);
+        errorCount++;
+      }
+
+      // 4. 清除整个.fshows目录（如果为空）
+      try {
+        const fshowsDir = path.join(os.homedir(), '.fshows');
+        if (await fs.pathExists(fshowsDir)) {
+          const files = await fs.readdir(fshowsDir);
+          if (files.length === 0) {
+            await fs.remove(fshowsDir);
+            console.log(chalk.green('✅ .fshows目录已清除'));
+            resetCount++;
+          } else {
+            console.log(chalk.gray('ℹ️  .fshows目录不为空，保留'));
+          }
+        }
+      } catch (error) {
+        console.log(chalk.red('❌ 清除.fshows目录失败:'), (error as Error).message);
+        errorCount++;
+      }
+
+      console.log(chalk.gray('\n' + '─'.repeat(50)));
+      
+      if (errorCount === 0) {
+        console.log(chalk.green.bold(`🎉 重置完成！共清理了 ${resetCount} 项内容`));
+        console.log(chalk.blue('\n💡 下次运行 fiter create 时将重新初始化所有配置'));
+      } else {
+        console.log(chalk.yellow.bold(`⚠️  重置部分完成：成功 ${resetCount} 项，失败 ${errorCount} 项`));
+        console.log(chalk.gray('请检查上面的错误信息'));
+      }
+      
+    } catch (error) {
+      console.error(chalk.red('❌ 重置操作失败:'), (error as Error).message);
+    }
   });
