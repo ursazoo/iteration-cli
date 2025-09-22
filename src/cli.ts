@@ -17,7 +17,7 @@ const program = new Command();
 program
   .name('fiter')
   .description('长城后端迭代管理CLI工具')
-  .version('1.0.0');
+  .version('1.1.0');
 
 // 创建迭代命令
 program
